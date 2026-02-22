@@ -1,32 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-def root():
-    return {"message": "ClipFlow AI Backend Running 🚀"}
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 import os
 from pymongo import MongoClient
 
 app = FastAPI()
 
+# MongoDB connection
 MONGODB_URI = os.getenv("MONGODB_URI")
 client = MongoClient(MONGODB_URI)
 db = client["clipflow_db"]
 
 print("✅ MongoDB Connected Successfully")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
