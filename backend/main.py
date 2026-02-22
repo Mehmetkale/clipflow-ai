@@ -49,7 +49,7 @@ def mongo_test():
     return {"ok": True, "collections": db.list_collection_names()}
 from datetime import datetime
 
-@app.post("/mongo-seed")
+@app.get("/mongo-seed")
 def mongo_seed():
     if db is None:
         return {"ok": False, "error": "DB not ready"}
