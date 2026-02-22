@@ -47,3 +47,39 @@ def mongo_test():
     if db is None:
         return {"ok": False, "error": "DB not ready"}
     return {"ok": True, "collections": db.list_collection_names()}
+from datetime import datetime
+
+@app.post("/mongo-seed")
+def mongo_seed():
+    if db is None:
+        return {"ok": False, "error": "DB not ready"}
+
+    col = db["videos"]
+
+    doc = {
+        "channel_id": "TEST_CHANNEL",
+        "video_id": "TEST_VIDEO",
+        "title": "Hello Mongo",
+        "created_at": datetime.utcnow(),
+        "status": "new"
+    }
+
+    result = col.insert_one(doc)
+
+    return {
+        "ok": True,
+        "inserted_id": str(result.inserted_id)
+    }
+    @app.get("/mongo-videos")
+def mongo_videos():
+    if db is None:
+        return {"ok": False, "error": "DB not ready"}
+
+    col = db["videos"]
+    items = list(col.find({}, {"_id": 0}))
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items
+    }
