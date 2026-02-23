@@ -1,5 +1,5 @@
-fastapi==0.115.6
-uvicorn[standard]==0.30.6
-pymongo[srv]==4.10.1
-requests==2.32.3
-apscheduler==3.10.4
+fastapi
+uvicorn
+pymongo[srv]
+requests
+apscheduler
