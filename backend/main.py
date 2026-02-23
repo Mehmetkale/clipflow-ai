@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -17,37 +19,41 @@ app.add_middleware(
 mongo_client = None
 db = None
 
+
 @app.on_event("startup")
 def startup_db():
     global mongo_client, db
+
     mongodb_uri = os.getenv("MONGODB_URI")
     if not mongodb_uri:
         print("❌ MONGODB_URI not found")
         return
 
-    mongo_client = MongoClient(
-        mongodb_uri,
-        server_api=ServerApi("1"),
-        serverSelectionTimeoutMS=10000
-    )
-
     try:
+        mongo_client = MongoClient(
+            mongodb_uri,
+            server_api=ServerApi("1"),
+            serverSelectionTimeoutMS=10000,
+        )
         mongo_client.admin.command("ping")
         db = mongo_client["clipflow_db"]
         print("✅ MongoDB Connected Successfully")
     except Exception as e:
+        db = None
         print("❌ Mongo Connection Failed:", e)
+
 
 @app.get("/")
 def root():
     return {"message": "ClipFlow AI Backend Running 🚀"}
+
 
 @app.get("/mongo-test")
 def mongo_test():
     if db is None:
         return {"ok": False, "error": "DB not ready"}
     return {"ok": True, "collections": db.list_collection_names()}
-from datetime import datetime
+
 
 @app.get("/mongo-seed")
 def mongo_seed():
@@ -61,25 +67,22 @@ def mongo_seed():
         "video_id": "TEST_VIDEO",
         "title": "Hello Mongo",
         "created_at": datetime.utcnow(),
-        "status": "new"
+        "status": "new",
     }
 
     result = col.insert_one(doc)
 
-    return {
-        "ok": True,
-        "inserted_id": str(result.inserted_id)
-    }
-    @app.get("/mongo-videos")
+    return {"ok": True, "inserted_id": str(result.inserted_id)}
+
+
+@app.get("/mongo-videos")
 def mongo_videos():
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
     col = db["videos"]
+    # _id'yi string olarak döndürmek istersen ayrı maplemek gerekir,
+    # şimdilik _id'yi tamamen çıkarıyorum:
     items = list(col.find({}, {"_id": 0}))
 
-    return {
-        "ok": True,
-        "count": len(items),
-        "items": items
-    }
+    return {"ok": True, "count": len(items), "items": items}
