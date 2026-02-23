@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-pymongo[srv]
+pymongo
 requests
 apscheduler
+youtube-transcript-api
