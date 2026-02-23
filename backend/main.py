@@ -1,6 +1,6 @@
 import os
+import requests
 from datetime import datetime
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -19,27 +19,26 @@ app.add_middleware(
 mongo_client = None
 db = None
 
-
 @app.on_event("startup")
 def startup_db():
     global mongo_client, db
-
     mongodb_uri = os.getenv("MONGODB_URI")
+
     if not mongodb_uri:
         print("❌ MONGODB_URI not found")
         return
 
+    mongo_client = MongoClient(
+        mongodb_uri,
+        server_api=ServerApi("1"),
+        serverSelectionTimeoutMS=10000
+    )
+
     try:
-        mongo_client = MongoClient(
-            mongodb_uri,
-            server_api=ServerApi("1"),
-            serverSelectionTimeoutMS=10000,
-        )
         mongo_client.admin.command("ping")
         db = mongo_client["clipflow_db"]
         print("✅ MongoDB Connected Successfully")
     except Exception as e:
-        db = None
         print("❌ Mongo Connection Failed:", e)
 
 
@@ -67,22 +66,54 @@ def mongo_seed():
         "video_id": "TEST_VIDEO",
         "title": "Hello Mongo",
         "created_at": datetime.utcnow(),
-        "status": "new",
+        "status": "new"
     }
 
     result = col.insert_one(doc)
 
-    return {"ok": True, "inserted_id": str(result.inserted_id)}
+    return {
+        "ok": True,
+        "inserted_id": str(result.inserted_id)
+    }
 
 
-@app.get("/mongo-videos")
-def mongo_videos():
+# 🔥 YENİ ENDPOINT
+@app.get("/add-channel")
+def add_channel(channel_url: str):
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
-    col = db["videos"]
-    # _id'yi string olarak döndürmek istersen ayrı maplemek gerekir,
-    # şimdilik _id'yi tamamen çıkarıyorum:
-    items = list(col.find({}, {"_id": 0}))
+    api_key = os.getenv("YOUTUBE_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "YOUTUBE_API_KEY not set"}
 
-    return {"ok": True, "count": len(items), "items": items}
+    # Handle URL'den username çıkar
+    if "@" in channel_url:
+        username = channel_url.split("@")[-1]
+    else:
+        return {"ok": False, "error": "Invalid channel URL"}
+
+    youtube_api = f"https://www.googleapis.com/youtube/v3/channels?part=id&forHandle={username}&key={api_key}"
+
+    response = requests.get(youtube_api)
+    data = response.json()
+
+    if "items" not in data or len(data["items"]) == 0:
+        return {"ok": False, "error": "Channel not found"}
+
+    channel_id = data["items"][0]["id"]
+
+    col = db["channels"]
+
+    col.insert_one({
+        "channel_id": channel_id,
+        "channel_url": channel_url,
+        "created_at": datetime.utcnow(),
+        "active": True
+    })
+
+    return {
+        "ok": True,
+        "channel_id": channel_id,
+        "saved_url": channel_url
+    }
