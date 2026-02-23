@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient, ASCENDING
 from pymongo.server_api import ServerApi
+from pymongo.errors import DuplicateKeyError
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -33,6 +34,7 @@ scheduler: Optional[BackgroundScheduler] = None
 CHANNELS_COL = "channels"
 VIDEOS_COL = "videos"
 SHORTS_PLANS_COL = "shorts_plans"
+TRANSCRIPTS_COL = "transcripts"
 
 
 # -----------------------------
@@ -146,6 +148,7 @@ def _youtube_fetch_latest_videos(channel_id: str, api_key: str, limit: int = 5) 
                 "video_url": f"https://www.youtube.com/watch?v={vid}",
                 "status": "new",
                 "created_at": _utcnow(),
+                "updated_at": _utcnow(),
             }
         )
 
@@ -157,15 +160,34 @@ def _youtube_fetch_latest_videos(channel_id: str, api_key: str, limit: int = 5) 
 # -----------------------------
 def _ensure_indexes():
     """
-    video_id unique -> duplicate insert'lerde patlamasın diye try/except yapacağız.
+    Create critical indexes.
     """
     try:
         db[VIDEOS_COL].create_index([("video_id", ASCENDING)], unique=True)
-        db[CHANNELS_COL].create_index([("channel_id", ASCENDING)], unique=True)
-        db[SHORTS_PLANS_COL].create_index([("video_id", ASCENDING)], unique=True)
-        print("✅ Indexes ready")
     except Exception as e:
-        print("Index warning:", e)
+        print("Index warning videos.video_id:", e)
+
+    try:
+        db[CHANNELS_COL].create_index([("channel_id", ASCENDING)], unique=True)
+    except Exception as e:
+        print("Index warning channels.channel_id:", e)
+
+    try:
+        db[SHORTS_PLANS_COL].create_index([("video_id", ASCENDING)], unique=True)
+    except Exception as e:
+        print("Index warning shorts_plans.video_id:", e)
+
+    try:
+        db[TRANSCRIPTS_COL].create_index([("video_id", ASCENDING)], unique=True)
+    except Exception as e:
+        print("Index warning transcripts.video_id:", e)
+
+    try:
+        db[VIDEOS_COL].create_index([("status", ASCENDING), ("created_at", ASCENDING)])
+    except Exception as e:
+        print("Index warning videos.status:", e)
+
+    print("✅ Indexes ready")
 
 
 # -----------------------------
@@ -174,6 +196,7 @@ def _ensure_indexes():
 def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
     """
     Reads channels collection, fetches latest videos, inserts into videos.
+    Only active channels.
     """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
@@ -184,7 +207,7 @@ def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
 
     limit_per_channel = max(1, min(limit_per_channel, 50))
 
-    channels = list(db[CHANNELS_COL].find({}, {"_id": 0}))
+    channels = list(db[CHANNELS_COL].find({"active": True}, {"_id": 0}))
     total_new = 0
     details = []
 
@@ -200,8 +223,10 @@ def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
                 try:
                     db[VIDEOS_COL].insert_one(v)
                     inserted += 1
+                except DuplicateKeyError:
+                    pass
                 except Exception:
-                    # duplicate video_id (unique index)
+                    # ignore other insert errors
                     pass
 
             total_new += inserted
@@ -213,7 +238,7 @@ def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Shorts Planner (Transcript -> segments)
+# Transcript + Shorts Planner
 # -----------------------------
 def _fetch_transcript_with_timestamps(video_id: str) -> List[Dict[str, Any]]:
     """
@@ -277,6 +302,55 @@ def _build_short_segments(transcript: List[Dict[str, Any]], max_segments: int = 
     return segments
 
 
+def _create_or_update_plan(video_id: str, max_segments: int = 6) -> Dict[str, Any]:
+    """
+    Loads video from DB, fetches transcript, saves transcript, builds segments, saves plan.
+    Updates videos.status = planned if segments exist.
+    """
+    if db is None:
+        return {"ok": False, "error": "DB not ready"}
+
+    v = db[VIDEOS_COL].find_one({"video_id": video_id}, {"_id": 0})
+    if not v:
+        return {"ok": False, "error": "video_id not found in DB (scan first)"}
+
+    try:
+        transcript = _fetch_transcript_with_timestamps(video_id)
+    except Exception as e:
+        return {"ok": False, "error": f"transcript fetch failed: {str(e)}"}
+
+    # Save transcript
+    transcript_doc = {
+        "video_id": video_id,
+        "channel_id": v.get("channel_id"),
+        "fetched_at": _utcnow(),
+        "items": transcript,
+        "text": _text_join(transcript)[:200000],  # safety cap
+    }
+    db[TRANSCRIPTS_COL].update_one({"video_id": video_id}, {"$set": transcript_doc}, upsert=True)
+
+    segments = _build_short_segments(transcript, max_segments=max_segments)
+
+    plan_doc = {
+        "video_id": video_id,
+        "channel_id": v.get("channel_id"),
+        "video_url": v.get("video_url"),
+        "source_title": v.get("title"),
+        "created_at": _utcnow(),
+        "segments": segments,
+    }
+    db[SHORTS_PLANS_COL].update_one({"video_id": video_id}, {"$set": plan_doc}, upsert=True)
+
+    # Update video status
+    new_status = "planned" if len(segments) > 0 else "no_segments"
+    db[VIDEOS_COL].update_one(
+        {"video_id": video_id},
+        {"$set": {"status": new_status, "updated_at": _utcnow()}},
+    )
+
+    return {"ok": True, "video_id": video_id, "count": len(segments), "segments": segments, "status": new_status}
+
+
 # -----------------------------
 # Startup / Shutdown
 # -----------------------------
@@ -300,6 +374,15 @@ def startup():
         print("✅ Mongo Connected")
 
         _ensure_indexes()
+
+        # Normalize older channel docs (optional small migration)
+        try:
+            db[CHANNELS_COL].update_many(
+                {"active": {"$exists": False}},
+                {"$set": {"active": True, "updated_at": _utcnow()}},
+            )
+        except Exception:
+            pass
 
     except Exception as e:
         print("❌ Mongo connection failed:", e)
@@ -356,12 +439,12 @@ def health():
 def list_channels():
     if db is None:
         return {"ok": False, "error": "DB not ready"}
-    items = list(db[CHANNELS_COL].find({}, {"_id": 0}))
+    items = list(db[CHANNELS_COL].find({}, {"_id": 0}).sort("created_at", -1))
     return {"ok": True, "count": len(items), "items": items}
 
 
 @app.get("/add-channel")
-def add_channel(channel_url: str):
+def add_channel(channel_url: str, active: bool = True):
     """
     Example:
       /add-channel?channel_url=https://www.youtube.com/@MrBeast
@@ -381,16 +464,21 @@ def add_channel(channel_url: str):
         else:
             channel_id = _youtube_get_channel_id_by_handle(parsed["value"], api_key)
 
+        now = _utcnow()
         db[CHANNELS_COL].update_one(
             {"channel_id": channel_id},
             {
-                "$set": {"url": channel_url.strip(), "updated_at": _utcnow()},
-                "$setOnInsert": {"created_at": _utcnow()},
+                "$set": {
+                    "channel_url": channel_url.strip(),
+                    "active": bool(active),
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
             },
             upsert=True,
         )
 
-        return {"ok": True, "channel_id": channel_id, "saved_url": channel_url.strip()}
+        return {"ok": True, "channel_id": channel_id, "saved_url": channel_url.strip(), "active": bool(active)}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -405,12 +493,45 @@ def scan_channels(limit_per_channel: int = 5):
     return _scan_all_channels(limit_per_channel=limit_per_channel)
 
 
+@app.get("/run-once")
+def run_once(limit_per_channel: int = 5, auto_plan: bool = False, max_videos_to_plan: int = 3, max_segments: int = 6):
+    """
+    Alias endpoint for manual run (same as scan), optionally auto transcript+plan for newest videos.
+
+    Examples:
+      /run-once
+      /run-once?limit_per_channel=10
+      /run-once?auto_plan=true&max_videos_to_plan=3
+    """
+    result = _scan_all_channels(limit_per_channel=limit_per_channel)
+
+    planned = []
+    if db is not None and auto_plan and result.get("ok"):
+        max_videos_to_plan = max(1, min(max_videos_to_plan, 20))
+        max_segments = max(1, min(max_segments, 12))
+
+        # plan newest "new" videos
+        newest = list(
+            db[VIDEOS_COL]
+            .find({"status": "new"}, {"_id": 0, "video_id": 1})
+            .sort("created_at", -1)
+            .limit(max_videos_to_plan)
+        )
+
+        for x in newest:
+            vid = x["video_id"]
+            planned.append(_create_or_update_plan(vid, max_segments=max_segments))
+
+    return {"ok": True, "scan": result, "auto_plan": bool(auto_plan), "planned": planned}
+
+
 @app.get("/videos")
-def list_videos(channel_id: Optional[str] = None, limit: int = 50):
+def list_videos(channel_id: Optional[str] = None, limit: int = 50, status: Optional[str] = None):
     """
     /videos
     /videos?limit=20
     /videos?channel_id=UCxxxx&limit=50
+    /videos?status=new
     """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
@@ -419,23 +540,33 @@ def list_videos(channel_id: Optional[str] = None, limit: int = 50):
     q: Dict[str, Any] = {}
     if channel_id:
         q["channel_id"] = channel_id
+    if status:
+        q["status"] = status
 
     items = list(db[VIDEOS_COL].find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
     return {"ok": True, "count": len(items), "items": items}
 
 
-@app.get("/shorts/plan")
-def shorts_plan(video_id: str, max_segments: int = 6):
+@app.get("/transcript/upload")
+def transcript_upload(video_id: str, also_plan: bool = True, max_segments: int = 6):
     """
-    Creates/updates shorts plan for a given video_id using transcript timestamps.
-    Example:
-      /shorts/plan?video_id=oizVk6MY7tI&max_segments=6
+    Fetches transcript for video_id and stores it into DB.
+    Optionally also creates shorts plan.
+
+    Examples:
+      /transcript/upload?video_id=oizVk6MY7tI
+      /transcript/upload?video_id=oizVk6MY7tI&also_plan=false
     """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
     max_segments = max(1, min(max_segments, 12))
 
+    # If also_plan -> do everything in one go
+    if also_plan:
+        return _create_or_update_plan(video_id, max_segments=max_segments)
+
+    # Only transcript
     v = db[VIDEOS_COL].find_one({"video_id": video_id}, {"_id": 0})
     if not v:
         return {"ok": False, "error": "video_id not found in DB (scan first)"}
@@ -445,20 +576,33 @@ def shorts_plan(video_id: str, max_segments: int = 6):
     except Exception as e:
         return {"ok": False, "error": f"transcript fetch failed: {str(e)}"}
 
-    segments = _build_short_segments(transcript, max_segments=max_segments)
-
-    doc = {
+    transcript_doc = {
         "video_id": video_id,
         "channel_id": v.get("channel_id"),
-        "video_url": v.get("video_url"),
-        "source_title": v.get("title"),
-        "created_at": _utcnow(),
-        "segments": segments,
+        "fetched_at": _utcnow(),
+        "items": transcript,
+        "text": _text_join(transcript)[:200000],
     }
+    db[TRANSCRIPTS_COL].update_one({"video_id": video_id}, {"$set": transcript_doc}, upsert=True)
 
-    db[SHORTS_PLANS_COL].update_one({"video_id": video_id}, {"$set": doc}, upsert=True)
+    # Mark video status
+    db[VIDEOS_COL].update_one(
+        {"video_id": video_id},
+        {"$set": {"status": "transcripted", "updated_at": _utcnow()}},
+    )
 
-    return {"ok": True, "video_id": video_id, "count": len(segments), "segments": segments}
+    return {"ok": True, "video_id": video_id, "transcript_items": len(transcript)}
+
+
+@app.get("/shorts/plan")
+def shorts_plan(video_id: str, max_segments: int = 6):
+    """
+    Creates/updates shorts plan for a given video_id using transcript timestamps.
+    Example:
+      /shorts/plan?video_id=oizVk6MY7tI&max_segments=6
+    """
+    max_segments = max(1, min(max_segments, 12))
+    return _create_or_update_plan(video_id, max_segments=max_segments)
 
 
 @app.get("/shorts/plans")
@@ -474,4 +618,20 @@ def shorts_plans(video_id: str):
     doc = db[SHORTS_PLANS_COL].find_one({"video_id": video_id}, {"_id": 0})
     if not doc:
         return {"ok": False, "error": "no plan yet. call /shorts/plan first"}
+    return {"ok": True, "data": doc}
+
+
+@app.get("/transcript/get")
+def transcript_get(video_id: str):
+    """
+    Returns stored transcript (if exists).
+    Example:
+      /transcript/get?video_id=oizVk6MY7tI
+    """
+    if db is None:
+        return {"ok": False, "error": "DB not ready"}
+
+    doc = db[TRANSCRIPTS_COL].find_one({"video_id": video_id}, {"_id": 0})
+    if not doc:
+        return {"ok": False, "error": "no transcript yet. call /transcript/upload first"}
     return {"ok": True, "data": doc}
