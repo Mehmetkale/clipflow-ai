@@ -4,11 +4,14 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 import requests
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient, ASCENDING
 from pymongo.server_api import ServerApi
 from apscheduler.schedulers.background import BackgroundScheduler
+
+from youtube_transcript_api import YouTubeTranscriptApi
+
 
 # -----------------------------
 # App
@@ -27,15 +30,10 @@ mongo_client: Optional[MongoClient] = None
 db = None
 scheduler: Optional[BackgroundScheduler] = None
 
-# -----------------------------
-# Collections
-# -----------------------------
 CHANNELS_COL = "channels"
 VIDEOS_COL = "videos"
+SHORTS_PLANS_COL = "shorts_plans"
 
-TRANSCRIPTS_COL = "transcripts"
-SHORTS_CANDIDATES_COL = "shorts_candidates"
-SHORTS_EXPORTS_COL = "shorts_exports"  # ileride export/editleme için
 
 # -----------------------------
 # Helpers
@@ -43,9 +41,11 @@ SHORTS_EXPORTS_COL = "shorts_exports"  # ileride export/editleme için
 def _utcnow():
     return datetime.now(timezone.utc)
 
+
 def _get_env(name: str) -> Optional[str]:
     v = os.getenv(name)
     return v.strip() if v else None
+
 
 # -----------------------------
 # YouTube Helpers
@@ -57,7 +57,9 @@ def _extract_handle_or_channel_id(channel_url: str) -> Dict[str, str]:
       - https://youtube.com/@MrBeast
       - @MrBeast
       - https://www.youtube.com/channel/UCxxxx
-      - UCxxxx (direct)
+      - UCxxxx
+    Returns:
+      {"type": "handle", "value": "MrBeast"}  OR  {"type": "channel_id", "value": "UCxxxx"}
     """
     s = channel_url.strip()
 
@@ -74,34 +76,39 @@ def _extract_handle_or_channel_id(channel_url: str) -> Dict[str, str]:
     if m:
         return {"type": "handle", "value": m.group(1)}
 
-    # direct UCxxxx
-    if s.startswith("UC") and re.fullmatch(r"UC[a-zA-Z0-9_-]{10,}", s):
+    # direct channel id
+    if re.fullmatch(r"UC[a-zA-Z0-9_-]{10,}", s):
         return {"type": "channel_id", "value": s}
 
-    # fallback: just "MrBeast"
+    # last fallback: plain handle
     if re.fullmatch(r"[a-zA-Z0-9_.-]+", s):
         return {"type": "handle", "value": s}
 
     raise ValueError("Invalid channel format")
 
+
 def _youtube_get_channel_id_by_handle(handle: str, api_key: str) -> str:
     """
-    YouTube Data API supports 'forHandle' in channels.list
+    YouTube Data API v3 supports forHandle in channels.list
     """
     url = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "id", "forHandle": handle, "key": api_key}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    items = r.json().get("items", [])
+
+    items = (r.json() or {}).get("items", [])
     if not items:
         raise ValueError(f"Handle not found: @{handle}")
     return items[0]["id"]
 
+
 def _youtube_fetch_latest_videos(channel_id: str, api_key: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Fetch latest videos via search.list ordered by date.
+    Uses search.list to fetch latest videos for a channel.
+    Saves title + publish date + thumbnail + url.
     """
     limit = max(1, min(limit, 50))
+
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "part": "snippet",
@@ -114,8 +121,9 @@ def _youtube_fetch_latest_videos(channel_id: str, api_key: str, limit: int = 5) 
     r = requests.get(url, params=params, timeout=25)
     r.raise_for_status()
 
-    out: List[Dict[str, Any]] = []
-    for item in r.json().get("items", []):
+    out = []
+    data = r.json() or {}
+    for item in data.get("items", []):
         vid = (item.get("id") or {}).get("videoId")
         sn = item.get("snippet") or {}
         if not vid:
@@ -140,66 +148,41 @@ def _youtube_fetch_latest_videos(channel_id: str, api_key: str, limit: int = 5) 
                 "created_at": _utcnow(),
             }
         )
+
     return out
 
-# -----------------------------
-# Shorts Helpers
-# -----------------------------
-def _generate_shorts_candidates_from_text(text: str) -> List[Dict[str, Any]]:
-    """
-    Şimdilik basit kural tabanlı:
-    - Noktalara göre böl
-    - Uzun cümleleri "hook" olarak al
-    - İlk 10 taneyi döndür
-    İleride OpenAI ile çok daha iyi hale getireceğiz.
-    """
-    # basit split
-    raw = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-    sentences = [s for s in raw if len(s) >= 40]
-
-    candidates: List[Dict[str, Any]] = []
-    for i, s in enumerate(sentences[:10]):
-        score = min(100, 60 + (len(s) // 5))
-        candidates.append(
-            {
-                "index": i,
-                "hook": s[:160],
-                "reason": "Strong statement / emotional hook (heuristic)",
-                "score": int(score),
-            }
-        )
-    return candidates
 
 # -----------------------------
 # DB Setup
 # -----------------------------
 def _ensure_indexes():
     """
-    Unique indexler:
-      - videos.video_id unique
-      - channels.channel_id unique
-      - transcripts.video_id unique
-      - shorts_candidates.video_id unique
+    video_id unique -> duplicate insert'lerde patlamasın diye try/except yapacağız.
     """
     try:
         db[VIDEOS_COL].create_index([("video_id", ASCENDING)], unique=True)
         db[CHANNELS_COL].create_index([("channel_id", ASCENDING)], unique=True)
-        db[TRANSCRIPTS_COL].create_index([("video_id", ASCENDING)], unique=True)
-        db[SHORTS_CANDIDATES_COL].create_index([("video_id", ASCENDING)], unique=True)
+        db[SHORTS_PLANS_COL].create_index([("video_id", ASCENDING)], unique=True)
         print("✅ Indexes ready")
     except Exception as e:
         print("Index warning:", e)
+
 
 # -----------------------------
 # Scanner
 # -----------------------------
 def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
+    """
+    Reads channels collection, fetches latest videos, inserts into videos.
+    """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
     api_key = _get_env("YOUTUBE_API_KEY")
     if not api_key:
         return {"ok": False, "error": "YOUTUBE_API_KEY not set"}
+
+    limit_per_channel = max(1, min(limit_per_channel, 50))
 
     channels = list(db[CHANNELS_COL].find({}, {"_id": 0}))
     total_new = 0
@@ -212,20 +195,87 @@ def _scan_all_channels(limit_per_channel: int = 5) -> Dict[str, Any]:
 
         inserted = 0
         try:
-            videos = _youtube_fetch_latest_videos(ch_id, api_key, limit_per_channel)
+            videos = _youtube_fetch_latest_videos(ch_id, api_key, limit=limit_per_channel)
             for v in videos:
                 try:
                     db[VIDEOS_COL].insert_one(v)
                     inserted += 1
-                    total_new += 1
                 except Exception:
-                    # duplicate video_id
+                    # duplicate video_id (unique index)
                     pass
+
+            total_new += inserted
             details.append({"channel_id": ch_id, "inserted": inserted})
         except Exception as e:
             details.append({"channel_id": ch_id, "error": str(e)})
 
     return {"ok": True, "channels": len(channels), "total_new": total_new, "details": details}
+
+
+# -----------------------------
+# Shorts Planner (Transcript -> segments)
+# -----------------------------
+def _fetch_transcript_with_timestamps(video_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns: [{text, start, duration}, ...]
+    """
+    try:
+        return YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US"])
+    except Exception:
+        return YouTubeTranscriptApi.get_transcript(video_id)
+
+
+def _text_join(items: List[Dict[str, Any]]) -> str:
+    return " ".join([x.get("text", "").replace("\n", " ").strip() for x in items]).strip()
+
+
+def _build_short_segments(transcript: List[Dict[str, Any]], max_segments: int = 6) -> List[Dict[str, Any]]:
+    """
+    MVP segment picker:
+    - transcript'i ~52 saniyelik bloklara böler
+    - boş/çok kısa olanları eler
+    """
+    segments: List[Dict[str, Any]] = []
+    if not transcript:
+        return segments
+
+    i = 0
+    while i < len(transcript) and len(segments) < max_segments:
+        start = float(transcript[i]["start"])
+        end_target = start + 52.0
+
+        chunk = []
+        j = i
+        while j < len(transcript):
+            s = float(transcript[j]["start"])
+            if s > end_target:
+                break
+            chunk.append(transcript[j])
+            j += 1
+
+        text = _text_join(chunk)
+        text_clean = re.sub(r"\s+", " ", text).strip()
+
+        if len(text_clean) >= 80:
+            last = chunk[-1]
+            end = float(last["start"]) + float(last.get("duration", 0) or 0)
+            hook = text_clean[:160]
+            score = min(100, 60 + len(text_clean) // 20)
+
+            segments.append(
+                {
+                    "start_sec": round(start, 2),
+                    "end_sec": round(end, 2),
+                    "hook": hook,
+                    "title_suggestion": hook[:70],
+                    "score": int(score),
+                }
+            )
+
+        i = max(i + 1, j)
+
+    return segments
+
 
 # -----------------------------
 # Startup / Shutdown
@@ -237,7 +287,6 @@ def startup():
     mongodb_uri = _get_env("MONGODB_URI")
     if not mongodb_uri:
         print("❌ MONGODB_URI not set")
-        db = None
         return
 
     try:
@@ -253,14 +302,14 @@ def startup():
         _ensure_indexes()
 
     except Exception as e:
-        print("Mongo connection failed:", e)
+        print("❌ Mongo connection failed:", e)
         db = None
         return
 
     # Scheduler: every 10 minutes
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
-        lambda: _scan_all_channels(5),
+        lambda: _scan_all_channels(limit_per_channel=5),
         "interval",
         minutes=10,
         id="scan_job",
@@ -268,6 +317,7 @@ def startup():
     )
     scheduler.start()
     print("✅ Scheduler running (10 min interval)")
+
 
 @app.on_event("shutdown")
 def shutdown():
@@ -283,12 +333,14 @@ def shutdown():
     except Exception:
         pass
 
+
 # -----------------------------
 # Routes
 # -----------------------------
 @app.get("/")
 def root():
     return {"message": "ClipFlow Backend Running 🚀"}
+
 
 @app.get("/health")
 def health():
@@ -299,8 +351,21 @@ def health():
         "time": _utcnow().isoformat(),
     }
 
+
+@app.get("/channels")
+def list_channels():
+    if db is None:
+        return {"ok": False, "error": "DB not ready"}
+    items = list(db[CHANNELS_COL].find({}, {"_id": 0}))
+    return {"ok": True, "count": len(items), "items": items}
+
+
 @app.get("/add-channel")
 def add_channel(channel_url: str):
+    """
+    Example:
+      /add-channel?channel_url=https://www.youtube.com/@MrBeast
+    """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
@@ -310,17 +375,17 @@ def add_channel(channel_url: str):
 
     try:
         parsed = _extract_handle_or_channel_id(channel_url)
+
         if parsed["type"] == "channel_id":
             channel_id = parsed["value"]
         else:
             channel_id = _youtube_get_channel_id_by_handle(parsed["value"], api_key)
 
-        now = _utcnow()
         db[CHANNELS_COL].update_one(
             {"channel_id": channel_id},
             {
-                "$set": {"url": channel_url.strip(), "updated_at": now},
-                "$setOnInsert": {"created_at": now},
+                "$set": {"url": channel_url.strip(), "updated_at": _utcnow()},
+                "$setOnInsert": {"created_at": _utcnow()},
             },
             upsert=True,
         )
@@ -330,12 +395,23 @@ def add_channel(channel_url: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 @app.get("/scan-channels")
 def scan_channels(limit_per_channel: int = 5):
-    return _scan_all_channels(limit_per_channel)
+    """
+    Manual scan now:
+      /scan-channels?limit_per_channel=5
+    """
+    return _scan_all_channels(limit_per_channel=limit_per_channel)
+
 
 @app.get("/videos")
-def list_videos(limit: int = 50, channel_id: Optional[str] = None):
+def list_videos(channel_id: Optional[str] = None, limit: int = 50):
+    """
+    /videos
+    /videos?limit=20
+    /videos?channel_id=UCxxxx&limit=50
+    """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
@@ -344,73 +420,58 @@ def list_videos(limit: int = 50, channel_id: Optional[str] = None):
     if channel_id:
         q["channel_id"] = channel_id
 
-    items = list(
-        db[VIDEOS_COL]
-        .find(q, {"_id": 0})
-        .sort("created_at", -1)
-        .limit(limit)
-    )
+    items = list(db[VIDEOS_COL].find(q, {"_id": 0}).sort("created_at", -1).limit(limit))
     return {"ok": True, "count": len(items), "items": items}
 
-@app.get("/channels")
-def list_channels():
-    if db is None:
-        return {"ok": False, "error": "DB not ready"}
-    items = list(db[CHANNELS_COL].find({}, {"_id": 0}).sort("created_at", -1))
-    return {"ok": True, "count": len(items), "items": items}
 
-# -----------------------------
-# Transcript + Shorts Routes
-# -----------------------------
-@app.post("/transcript/upload")
-def upload_transcript(video_id: str, text: str = Body(...)):
+@app.get("/shorts/plan")
+def shorts_plan(video_id: str, max_segments: int = 6):
+    """
+    Creates/updates shorts plan for a given video_id using transcript timestamps.
+    Example:
+      /shorts/plan?video_id=oizVk6MY7tI&max_segments=6
+    """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
+
+    max_segments = max(1, min(max_segments, 12))
+
+    v = db[VIDEOS_COL].find_one({"video_id": video_id}, {"_id": 0})
+    if not v:
+        return {"ok": False, "error": "video_id not found in DB (scan first)"}
+
+    try:
+        transcript = _fetch_transcript_with_timestamps(video_id)
+    except Exception as e:
+        return {"ok": False, "error": f"transcript fetch failed: {str(e)}"}
+
+    segments = _build_short_segments(transcript, max_segments=max_segments)
 
     doc = {
         "video_id": video_id,
-        "text": text,
+        "channel_id": v.get("channel_id"),
+        "video_url": v.get("video_url"),
+        "source_title": v.get("title"),
         "created_at": _utcnow(),
+        "segments": segments,
     }
 
-    db[TRANSCRIPTS_COL].update_one(
-        {"video_id": video_id},
-        {"$set": doc},
-        upsert=True
-    )
+    db[SHORTS_PLANS_COL].update_one({"video_id": video_id}, {"$set": doc}, upsert=True)
 
-    return {"ok": True, "video_id": video_id}
+    return {"ok": True, "video_id": video_id, "count": len(segments), "segments": segments}
 
-@app.post("/shorts/candidates")
-def generate_candidates(video_id: str):
+
+@app.get("/shorts/plans")
+def shorts_plans(video_id: str):
+    """
+    Returns existing plan.
+    Example:
+      /shorts/plans?video_id=oizVk6MY7tI
+    """
     if db is None:
         return {"ok": False, "error": "DB not ready"}
 
-    tr = db[TRANSCRIPTS_COL].find_one({"video_id": video_id})
-    if not tr:
-        return {"ok": False, "error": "Transcript not found"}
-
-    candidates = _generate_shorts_candidates_from_text(tr.get("text") or "")
-
-    db[SHORTS_CANDIDATES_COL].update_one(
-        {"video_id": video_id},
-        {"$set": {
-            "video_id": video_id,
-            "candidates": candidates,
-            "created_at": _utcnow(),
-        }},
-        upsert=True
-    )
-
-    return {"ok": True, "count": len(candidates), "candidates": candidates}
-
-@app.get("/shorts/list")
-def list_shorts(video_id: str):
-    if db is None:
-        return {"ok": False, "error": "DB not ready"}
-
-    data = db[SHORTS_CANDIDATES_COL].find_one({"video_id": video_id}, {"_id": 0})
-    if not data:
-        return {"ok": False, "error": "No shorts found"}
-
-    return {"ok": True, "data": data}
+    doc = db[SHORTS_PLANS_COL].find_one({"video_id": video_id}, {"_id": 0})
+    if not doc:
+        return {"ok": False, "error": "no plan yet. call /shorts/plan first"}
+    return {"ok": True, "data": doc}
